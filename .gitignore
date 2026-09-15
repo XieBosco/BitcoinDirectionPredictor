@@ -1,0 +1,189 @@
+# ==============================================================================
+# Polymarket Bot Repository .gitignore
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Credentials, API Keys, Private Keys & Secrets (CRITICAL)
+# ------------------------------------------------------------------------------
+.env
+.env.*
+*.env
+!.env.example
+!.env.*.example
+
+# Private key files, builder keys, and wallet dumps
+*keys.txt
+*_keys.txt
+*private_key*
+poly_builder_keys.txt
+*.pem
+*.key
+*.keystore
+*.pkcs12
+*wallet*.json
+utc--*
+credentials/
+secrets/
+
+# Project configurations containing real keys/addresses
+config.yaml
+config.yml
+config.*.yaml
+config.*.yml
+!config.example.yaml
+!config.example.yml
+!config.*.example.yaml
+!config.*.example.yml
+
+# ------------------------------------------------------------------------------
+# 2. Python Environment & Bytecode
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.dll
+
+# Distribution / Packaging
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+*.dist-info/
+*.egg
+
+# ------------------------------------------------------------------------------
+# 3. Virtual Environments
+# ------------------------------------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+*.venv
+
+# ------------------------------------------------------------------------------
+# 4. Testing, Caches & Code Quality
+# ------------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+nosetests.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# ------------------------------------------------------------------------------
+# 5. Market Data Dumps & Large Dataset Files (>100MB GitHub limit)
+# ------------------------------------------------------------------------------
+# Raw Binance/Polymarket 1-second orderbook/tick data dumps
+binance_1s_*.csv
+btcusdt_1s_*.csv
+btcusdt_*.csv
+*_backtest_data.csv
+
+# Multi-megabyte row-level prediction logs
+row_level_predictions.csv
+test_predictions_with_ci.csv
+
+# Common large data formats & databases
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.sqlite
+*.sqlite3
+*.db
+data/
+datasets/
+raw_data/
+
+# ------------------------------------------------------------------------------
+# 6. Machine Learning Model Weights & Checkpoints
+# ------------------------------------------------------------------------------
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.pickle
+*.joblib
+checkpoints/
+
+# ------------------------------------------------------------------------------
+# 7. Jupyter Notebooks
+# ------------------------------------------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# ------------------------------------------------------------------------------
+# 8. Temporary Files, Scratch Scripts & Logs
+# ------------------------------------------------------------------------------
+tmp_*.py
+temp_*.py
+scratch/
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+current_log.txt
+*current_log.txt
+
+# ------------------------------------------------------------------------------
+# 9. IDE & Operating System Artifacts
+# ------------------------------------------------------------------------------
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ------------------------------------------------------------------------------
+# 10. Node / Frontend / Package Manager Artifacts
+# ------------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.next/
+.turbo/
+
+# Extras
+polymarket-trading-Bot
+my_poly_bot

@@ -1,0 +1,95 @@
+- Mean reversion
+- AI/ML
+- Order book flows
+- reversion
+- VWAP
+- HFT
+- VPS
+- Python or C/C++
+- Market microstructures
+- Academic Research
+- Liquitidy
+- Copybots
+- Market manipulation
+- Volume
+- Volatility
+- Ideal trading hours
+- 5-10% edge
+- Latency
+- Order book depth
+- Cumulative Volume Delta
+- Convolutional Neural Networks
+- Hawkes Processes
+- Order book imbalances
+- Order book intensity
+
+-----
+
+- Stationarity Tests using Augmented Dickey Fuller Tests
+- Half-Life Calculation: Use an Ornstein Uhlenbeck process to find the "half-life" of the mean reversion. 
+This tells you how long a trade typically takes to return to mean, helping you set realistic exit timeframes.
+- Define entry signls based on a Z-Score for entering when prices are above a standard deviation threshold.
+- Exit signal: Typically when the prices touches it moving average or reaches an opposite Z-score threshold 
+or hold to market resolution if there isn't enough time for a candle to flip.
+- Stop loss: 
+
+
+
+
+
+-----
+
+I have updated the analysis using a much larger dataset of 200,000 minutes (approx. 4.5 months of data), ensuring more robust statistics.
+
+Here is the updated report (saved in market_probabilities.py):
+
+Probability of Uniform Direction (5m close)
+There is a 60.83% probability that BTC, ETH, SOL, and XRP all close in the same direction (all Green or all Red) at the end of a 5-minute candle.
+
+Probability Altcoins Follow BTC
+When BTC has a clear direction, the probability that altcoins close in the same direction is:
+
+ETH/USDT: 82.38%
+SOL/USDT: 79.81%
+XRP/USDT: 77.67%
+BTC Reversal Probability (First 3 mins logic)
+When BTC moves in the opposite direction to all three altcoins during the first 3 minutes of a 5-minute candle, there is a 64.67% probability that BTC will reverse and close in the same direction as the altcoins by the end of the 5-minute candle.
+(Sample size: 1353 events)
+
+Altcoin Reversal Probability (New Statistic)
+When a specific altcoin moves in the opposite direction to BTC during the first 3 minutes of a 5-minute candle, the probability that the altcoin reverses to match BTC's direction by the end is:
+
+ETH: 63.26% (matches BTC)
+SOL: 56.95% (matches BTC)
+XRP: 54.91% (matches BTC)
+Interpretation: ETH is significantly more likely to correct itself to follow BTC than SOL or XRP.
+
+Trendline Reversion
+When a pair diverges significantly (> 2 standard deviations) from the group average, the probability of it reverting (moving back toward the average) in the short term is slightly better than a coin flip (~52-54%):
+
+BTC: ~52.2% (5m)
+ETH: ~52.0% (5m)
+SOL: ~53.6% (5m)
+XRP: ~52.0% (5m)
+
+
+----
+
+[!] BTC MOVED DOWN: -0.0201% at 00:37:17
+   Analyzing follow-up (Window: 1-10s) for move at 00:37:17...
+   Result: ethusdt: 67.4% (157/233) | solusdt: 60.9% (142/233) | xrpusdt: 60.9% (142/233)
+
+----
+
+[!] BTC MOVED DOWN: -0.0200% at 01:34:58
+   Analyzing +10s follow-up for move at 01:34:58: BTC -0.0200% | Target > -0.0100%...
+   Result: ethusdt: 61.9% (0.08s) | solusdt: 95.2% (0.08s) | xrpusdt: 47.6% (0.10s)
+
+----
+
+[!] BTC MOVED DOWN: -0.0207% at 16:05:07
+   Analyzing +10s follow-up for move at 16:05:07: BTC -0.0207% | Target > -0.0103%...
+   Result: ethusdt: 71.3% (0.11s) | solusdt: 87.4% (0.09s) | xrpusdt: 68.2% (0.40s)
+
+----
+

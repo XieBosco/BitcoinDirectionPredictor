@@ -1,0 +1,2 @@
+1. Run in terminal
+    c:/Users/fiona/Desktop/polymarket_bot/.venv/Scripts/python.exe research/live_probability_predictor.py --symbol BTCUSDT --training-csv research/btcusdt_1s_last24h.csv --interval 2 --loop

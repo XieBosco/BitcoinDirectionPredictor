@@ -1,0 +1,1139 @@
+"""Strict walk-forward comparison of calibrated 7-day logistic models vs Polymarket.
+
+This script compares three models on identical test rows:
+- 7day_logistic_baseline: standard sigmoid calibration (CalibratedClassifierCV)
+- 7day_logistic_enhanced: time-safe holdout calibration + bucketed method selection
+    (sigmoid vs isotonic) + shrinkage to base rate
+- polymarket: implied probabilities from Polymarket order book midpoint
+
+This experiment variant adds intrabar microstructure features:
+- Micro-price acceleration (2nd derivative of tick-level price)
+- Time-in-profit distribution within the forming 5-minute candle
+- Dynamic wick-to-body ratio on the forming candle
+- Intra-candle VWAP deviation from micro-VWAP
+
+This pruned variant removes the microstructure features that looked weak,
+noisy, or redundant in the earlier ablation tests.
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+ELAPSED_BINS = [100, 130, 160, 190, 220, 250, 291]
+ELAPSED_LABELS = ["100-129", "130-159", "160-189", "190-219", "220-249", "250-290"]
+NEW_INTRABAR_FEATURES = [
+    "micro_price_acceleration",
+    "time_in_profit_pct",
+    "time_below_open_pct",
+    "dynamic_wick_to_body_ratio",
+    "intra_candle_vwap_deviation",
+    "kinetic_energy_10s",
+    "tick_entropy_10s",
+    "micro_acceleration_decay_15s",
+    "tte_high_ratio",
+    "tte_low_ratio",
+    "tte_range_asymmetry",
+    "tick_continuation_reversal_ratio_20s",
+]
+
+ALL_MODEL_FEATURES = [
+    "close",
+    "volume",
+    "number_of_trades",
+    "log_return_1s",
+    "inst_vol_60s",
+    "inst_vol_60s_bps",
+    "trend_mean_60s",
+    "trend_zscore",
+    "buy_volume_ratio",
+    "vwap",
+    "return_from_candle_open",
+    "seconds_to_5m_close",
+    "fraction_of_candle_elapsed",
+    "micro_price_acceleration",
+    "time_in_profit_pct",
+    "time_below_open_pct",
+    "dynamic_wick_to_body_ratio",
+    "intra_candle_vwap_deviation",
+    "kinetic_energy_10s",
+    "tick_entropy_10s",
+    "micro_acceleration_decay_15s",
+    "tte_high_ratio",
+    "tte_low_ratio",
+    "tte_range_asymmetry",
+    "tick_continuation_reversal_ratio_20s",
+]
+
+PRUNED_MODEL_FEATURES = [
+    "close",
+    "volume",
+    "number_of_trades",
+    "log_return_1s",
+    "inst_vol_60s",
+    "inst_vol_60s_bps",
+    "trend_mean_60s",
+    "trend_zscore",
+    "buy_volume_ratio",
+    "vwap",
+    "return_from_candle_open",
+    "seconds_to_5m_close",
+    "fraction_of_candle_elapsed",
+    "micro_price_acceleration",
+    "intra_candle_vwap_deviation",
+    "tick_entropy_10s",
+    "tte_high_ratio",
+    "tte_range_asymmetry",
+]
+
+SUBSET_SEARCH_FEATURE_POOL = [
+    "intra_candle_vwap_deviation",
+    "tick_entropy_10s",
+    "micro_price_acceleration",
+    "micro_acceleration_decay_15s",
+    "tte_range_asymmetry",
+    "vwap",
+]
+
+
+def make_base_pipeline(feature_cols: List[str]) -> Pipeline:
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "num",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
+                feature_cols,
+            )
+        ],
+        remainder="drop",
+    )
+
+    return Pipeline(
+        steps=[
+            ("prep", preprocessor),
+            ("model", LogisticRegression(max_iter=2000, solver="lbfgs")),
+        ]
+    )
+
+
+def safe_log_loss(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    y_prob = np.clip(y_prob, 1e-6, 1 - 1e-6)
+    return float(log_loss(y_true, y_prob, labels=[0, 1]))
+
+
+def bucket_series(elapsed: pd.Series) -> pd.Series:
+    return pd.cut(elapsed, bins=ELAPSED_BINS, labels=ELAPSED_LABELS, right=False)
+
+
+def fit_sigmoid_calibrator(x_prob: np.ndarray, y: np.ndarray) -> LogisticRegression:
+    clf = LogisticRegression(max_iter=1000, solver="lbfgs")
+    clf.fit(x_prob.reshape(-1, 1), y)
+    return clf
+
+
+def predict_sigmoid(calibrator: LogisticRegression, x_prob: np.ndarray) -> np.ndarray:
+    pred = calibrator.predict_proba(x_prob.reshape(-1, 1))[:, 1]
+    return np.clip(pred, 1e-6, 1 - 1e-6)
+
+
+def fit_bucket_calibrators(
+    calib_df: pd.DataFrame,
+    min_bucket_samples: int = 200,
+    min_isotonic_samples: int = 1200,
+    min_isotonic_improvement: float = 0.002,
+) -> Tuple[Dict[str, Tuple[str, object]], pd.DataFrame]:
+    calibrators: Dict[str, Tuple[str, object]] = {}
+    diagnostics = []
+
+    for label in ELAPSED_LABELS:
+        g = calib_df[calib_df["elapsed_bucket"] == label].copy().sort_values("ts_order")
+        if len(g) < min_bucket_samples or g["y_true"].nunique() < 2:
+            calibrators[label] = ("identity", None)
+            diagnostics.append({"bucket": label, "method": "identity", "n": len(g), "log_loss": np.nan})
+            continue
+
+        x = np.clip(g["raw_prob"].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
+        y = g["y_true"].to_numpy(dtype=int)
+
+        # Time-safe split inside bucket: select method on validation segment only.
+        cut = int(len(g) * 0.7)
+        if cut < 50 or (len(g) - cut) < 50:
+            cut = len(g) // 2
+
+        x_tr, y_tr = x[:cut], y[:cut]
+        x_va, y_va = x[cut:], y[cut:]
+        if len(x_va) < 20 or len(np.unique(y_va)) < 2:
+            calibrators[label] = ("identity", None)
+            diagnostics.append({"bucket": label, "method": "identity", "n": len(g), "log_loss": np.nan})
+            continue
+
+        # Sigmoid option.
+        sig = fit_sigmoid_calibrator(x_tr, y_tr)
+        p_sig_va = predict_sigmoid(sig, x_va)
+        ll_sig = safe_log_loss(y_va, p_sig_va)
+
+        # Isotonic option with guardrails.
+        iso_allowed = len(g) >= min_isotonic_samples
+        ll_iso = np.inf
+        if iso_allowed:
+            iso = IsotonicRegression(out_of_bounds="clip")
+            iso.fit(x_tr, y_tr)
+            p_iso_va = np.clip(iso.predict(x_va), 1e-6, 1 - 1e-6)
+            ll_iso = safe_log_loss(y_va, p_iso_va)
+
+            # Smoothness guardrail: too many steps in isotonic is a common overfit symptom.
+            if hasattr(iso, "X_thresholds_") and len(iso.X_thresholds_) > 120:
+                iso_allowed = False
+
+        if iso_allowed and (ll_iso + min_isotonic_improvement < ll_sig):
+            # Refit selected method on full bucket calibration data.
+            iso_full = IsotonicRegression(out_of_bounds="clip")
+            iso_full.fit(x, y)
+            calibrators[label] = ("isotonic", iso_full)
+            diagnostics.append({"bucket": label, "method": "isotonic", "n": len(g), "log_loss": ll_iso})
+        else:
+            sig_full = fit_sigmoid_calibrator(x, y)
+            calibrators[label] = ("sigmoid", sig_full)
+            diagnostics.append({"bucket": label, "method": "sigmoid", "n": len(g), "log_loss": ll_sig})
+
+    return calibrators, pd.DataFrame(diagnostics)
+
+
+def apply_bucket_calibrators(raw_prob: np.ndarray, elapsed: np.ndarray, calibrators: Dict[str, Tuple[str, object]]) -> np.ndarray:
+    out = np.clip(raw_prob.astype(float), 1e-6, 1 - 1e-6)
+    elapsed_s = pd.Series(elapsed)
+    b = bucket_series(elapsed_s)
+
+    for label in ELAPSED_LABELS:
+        idx = (b == label).to_numpy()
+        if not np.any(idx):
+            continue
+        method, obj = calibrators.get(label, ("identity", None))
+        if method == "sigmoid" and obj is not None:
+            out[idx] = predict_sigmoid(obj, out[idx])
+        elif method == "isotonic" and obj is not None:
+            out[idx] = np.clip(obj.predict(out[idx]), 1e-6, 1 - 1e-6)
+
+    return np.clip(out, 1e-6, 1 - 1e-6)
+
+
+def tune_shrinkage_lambda(
+    p_calib: np.ndarray,
+    y_calib: np.ndarray,
+    base_rate: float,
+    max_calib_gap_regression_pp: float = 0.10,
+) -> Tuple[float, Dict[str, float]]:
+    p_calib = np.clip(p_calib, 1e-6, 1 - 1e-6)
+    base_gap_pp = float(np.mean(np.abs(p_calib - y_calib)) * 100.0)
+
+    best_lambda = 1.0
+    best_score = np.inf
+    best_meta: Dict[str, float] = {"log_loss": np.nan, "brier": np.nan, "calib_gap_pp": np.nan}
+
+    for lam in [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]:
+        p = lam * p_calib + (1.0 - lam) * base_rate
+        p = np.clip(p, 1e-6, 1 - 1e-6)
+        ll = safe_log_loss(y_calib, p)
+        br = float(brier_score_loss(y_calib, p))
+        gap_pp = float(np.mean(np.abs(p - y_calib)) * 100.0)
+
+        # Hard guardrail against making calibration gap worse on the calibration holdout.
+        if gap_pp > base_gap_pp + max_calib_gap_regression_pp:
+            continue
+
+        # Joint objective: prefer better log loss while accounting for Brier.
+        score = 0.7 * ll + 0.3 * br
+        if score < best_score:
+            best_score = score
+            best_lambda = lam
+            best_meta = {"log_loss": ll, "brier": br, "calib_gap_pp": gap_pp}
+
+    return best_lambda, best_meta
+
+
+def fetch_klines_1s(symbol: str, start_ms: int, end_ms: int) -> List[List]:
+    all_rows: List[List] = []
+    current_start = start_ms
+    session = requests.Session()
+
+    while current_start < end_ms:
+        params = {
+            "symbol": symbol,
+            "interval": "1s",
+            "startTime": current_start,
+            "endTime": end_ms,
+            "limit": 1000,
+        }
+
+        last_exc = None
+        batch = None
+        for attempt in range(5):
+            try:
+                response = session.get(BINANCE_KLINES_URL, params=params, timeout=30)
+                response.raise_for_status()
+                batch = response.json()
+                break
+            except Exception as exc:
+                last_exc = exc
+                import time
+                time.sleep(0.5 * (attempt + 1))
+
+        if batch is None:
+            raise RuntimeError(f"Failed Binance fetch after retries: {last_exc}")
+
+        if not batch:
+            break
+
+        all_rows.extend(batch)
+        current_start = int(batch[-1][0]) + 1000
+        import time
+        time.sleep(0.02)
+
+    return all_rows
+
+
+def fetch_klines_1s_chunked(symbol: str, start_ms: int, end_ms: int, chunk_hours: int = 6) -> List[List]:
+    chunk_ms = int(chunk_hours * 3600 * 1000)
+    cursor = start_ms
+    merged: List[List] = []
+    chunk_idx = 0
+
+    while cursor < end_ms:
+        chunk_idx += 1
+        c_end = min(end_ms, cursor + chunk_ms)
+        print(f"Fetching Binance chunk {chunk_idx}: {pd.to_datetime(cursor, unit='ms', utc=True)} -> {pd.to_datetime(c_end, unit='ms', utc=True)}")
+        rows = fetch_klines_1s(symbol=symbol, start_ms=cursor, end_ms=c_end)
+        merged.extend(rows)
+        cursor = c_end + 1000
+
+    return merged
+
+
+def build_binance_df(raw_rows: List[List]) -> pd.DataFrame:
+    columns = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_asset_volume",
+        "number_of_trades",
+        "taker_buy_base_asset_volume",
+        "taker_buy_quote_asset_volume",
+        "ignore",
+    ]
+
+    df = pd.DataFrame(raw_rows, columns=columns).drop(columns=["ignore"])
+
+    numeric_cols = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_asset_volume",
+        "number_of_trades",
+        "taker_buy_base_asset_volume",
+        "taker_buy_quote_asset_volume",
+    ]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    df = df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
+
+    # Feature engineering matching window generalization tests
+    df["log_return_1s"] = np.log(df["close"]).diff()
+
+    vol_window = 60
+    df["inst_vol_60s"] = df["log_return_1s"].rolling(window=vol_window, min_periods=10).std()
+    df["inst_vol_60s_bps"] = df["inst_vol_60s"] * 10000
+    df["trend_mean_60s"] = df["log_return_1s"].rolling(window=vol_window, min_periods=10).mean()
+    df["trend_zscore"] = df["trend_mean_60s"] / (df["inst_vol_60s"] + 1e-12)
+    df["vwap"] = df["quote_asset_volume"] / df["volume"].replace(0, np.nan)
+    df["buy_volume_ratio"] = df["taker_buy_base_asset_volume"] / df["volume"].replace(0, np.nan)
+
+    # 5-minute candle labels
+    df["candle_5m_start"] = df["open_time"].dt.floor("5min")
+    candle = (
+        df.groupby("candle_5m_start", as_index=False)
+        .agg(candle_open=("open", "first"), candle_close=("close", "last"))
+        .copy()
+    )
+    candle["target_up"] = (candle["candle_close"] > candle["candle_open"]).astype(int)
+
+    df = df.merge(candle[["candle_5m_start", "target_up"]], on="candle_5m_start", how="left")
+
+    # Temporal features within candle
+    candle_end = df["candle_5m_start"] + pd.Timedelta(minutes=5)
+    df["seconds_to_5m_close"] = (candle_end - df["open_time"]).dt.total_seconds().clip(lower=0)
+    df["fraction_of_candle_elapsed"] = 1.0 - (df["seconds_to_5m_close"] / 300.0)
+    df["return_from_candle_open"] = (
+        df["close"] / df.groupby("candle_5m_start")["open"].transform("first")
+    ) - 1.0
+
+    df = add_new_intrabar_features(df)
+
+    return df
+
+
+def add_new_intrabar_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add experiment-specific intrabar microstructure features to an existing Binance frame."""
+    df = df.copy()
+
+    if "candle_5m_start" not in df.columns:
+        df["candle_5m_start"] = pd.to_datetime(df["open_time"], utc=True).dt.floor("5min")
+
+    # Micro-price acceleration: second derivative of tick-level close price.
+    df["price_velocity_1s"] = df["close"].diff()
+    df["micro_price_acceleration"] = df["price_velocity_1s"].diff()
+
+    # Time-in-profit distribution: cumulative fraction of elapsed candle time above/below open.
+    candle_open = df.groupby("candle_5m_start")["open"].transform("first")
+    above_open = (df["close"] > candle_open).astype(float)
+    below_open = (df["close"] < candle_open).astype(float)
+    ticks_in_candle = df.groupby("candle_5m_start").cumcount() + 1
+    df["time_in_profit_pct"] = (
+        above_open.groupby(df["candle_5m_start"]).cumsum() / ticks_in_candle
+    )
+    df["time_below_open_pct"] = (
+        below_open.groupby(df["candle_5m_start"]).cumsum() / ticks_in_candle
+    )
+
+    # Dynamic wick-to-body ratio using running intrabar high/low vs live body size.
+    running_high = df.groupby("candle_5m_start")["high"].cummax()
+    running_low = df.groupby("candle_5m_start")["low"].cummin()
+    running_body = (df["close"] - candle_open).abs()
+    upper_wick = (running_high - np.maximum(candle_open, df["close"])).clip(lower=0)
+    lower_wick = (np.minimum(candle_open, df["close"]) - running_low).clip(lower=0)
+    df["dynamic_wick_to_body_ratio"] = (upper_wick + lower_wick) / (running_body + 1e-9)
+
+    # Intra-candle VWAP deviation from a micro-VWAP built from candle open forward.
+    candle_cum_quote = df.groupby("candle_5m_start")["quote_asset_volume"].cumsum()
+    candle_cum_volume = df.groupby("candle_5m_start")["volume"].cumsum()
+    df["micro_vwap"] = candle_cum_quote / candle_cum_volume.replace(0, np.nan)
+    df["intra_candle_vwap_deviation"] = (df["close"] / df["micro_vwap"]) - 1.0
+
+    # Kinetic energy of price on a 10-second velocity window.
+    price_delta_10s = df["close"].diff(10)
+    velocity_10s = price_delta_10s / 10.0
+    volume_mass_10s = df["volume"].rolling(window=10, min_periods=3).sum()
+    df["kinetic_energy_10s"] = volume_mass_10s * np.square(velocity_10s)
+
+    # Sub-candle tick entropy (up/down/flat) over a rolling 10-second window.
+    tick_dir = np.sign(df["close"].diff()).fillna(0).astype(int)
+    is_up = (tick_dir > 0).astype(float)
+    is_down = (tick_dir < 0).astype(float)
+    is_flat = (tick_dir == 0).astype(float)
+    p_up = is_up.rolling(window=10, min_periods=3).mean()
+    p_down = is_down.rolling(window=10, min_periods=3).mean()
+    p_flat = is_flat.rolling(window=10, min_periods=3).mean()
+    probs = np.vstack([p_up.to_numpy(), p_down.to_numpy(), p_flat.to_numpy()]).T
+    probs = np.clip(probs, 1e-12, 1.0)
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    df["tick_entropy_10s"] = -np.sum(probs * (np.log(probs) / np.log(2.0)), axis=1)
+
+    # Micro-acceleration decay: acceleration minus its recent average.
+    accel_mean_15s = df["micro_price_acceleration"].rolling(window=15, min_periods=5).mean()
+    df["micro_acceleration_decay_15s"] = df["micro_price_acceleration"] - accel_mean_15s
+
+    # Time-to-extreme ratios inside each candle (normalized by 300s).
+    idx_in_candle = df.groupby("candle_5m_start").cumcount().astype(float)
+    sec_in_candle = np.minimum(idx_in_candle, 299.0)
+    running_high = df.groupby("candle_5m_start")["high"].cummax()
+    running_low = df.groupby("candle_5m_start")["low"].cummin()
+    hit_new_high = (df["high"] >= running_high).astype(int)
+    hit_new_low = (df["low"] <= running_low).astype(int)
+    t_high = sec_in_candle.where(hit_new_high.astype(bool)).groupby(df["candle_5m_start"]).ffill().fillna(0.0)
+    t_low = sec_in_candle.where(hit_new_low.astype(bool)).groupby(df["candle_5m_start"]).ffill().fillna(0.0)
+    df["tte_high_ratio"] = t_high / 300.0
+    df["tte_low_ratio"] = t_low / 300.0
+    df["tte_range_asymmetry"] = (t_low - t_high) / 300.0
+
+    # Tick continuation vs reversal ratio over 20 seconds.
+    prev_dir = tick_dir.shift(1)
+    continuation = ((tick_dir != 0) & (prev_dir != 0) & (tick_dir == prev_dir)).astype(float)
+    reversal = ((tick_dir != 0) & (prev_dir != 0) & (tick_dir != prev_dir)).astype(float)
+    cont_20 = continuation.rolling(window=20, min_periods=5).sum()
+    rev_20 = reversal.rolling(window=20, min_periods=5).sum()
+    df["tick_continuation_reversal_ratio_20s"] = cont_20 / (rev_20 + 1e-6)
+
+    return df
+
+
+def load_polymarket_1s(polymarket_csv: Path) -> pd.DataFrame:
+    """Load Polymarket data upsampled to 1-second resolution."""
+    df = pd.read_csv(polymarket_csv)
+    df["timestamp"] = pd.to_datetime(df["timestamp_log"], unit="s", utc=True)
+    df["start_time"] = pd.to_numeric(df["start_time"], errors="coerce")
+    df["elapsed"] = pd.to_numeric(df["elapsed"], errors="coerce")
+    df["label"] = (df["winner"].astype(str).str.lower() == "up").astype(int)
+    df["implied_prob"] = (pd.to_numeric(df["bid_YES"], errors="coerce") + pd.to_numeric(df["ask_YES"], errors="coerce")) / 2.0
+    df["implied_prob"] = df["implied_prob"].clip(0.0, 1.0)
+
+    # Upsample 2s -> 1s by carry-forward within each market slug.
+    upsampled = []
+    for slug, g in df.groupby("slug", sort=False):
+        g = g.sort_values("timestamp").copy()
+        idx = pd.date_range(start=g["timestamp"].min(), end=g["timestamp"].max(), freq="1s", tz="UTC")
+        u = g.set_index("timestamp").reindex(idx)
+        for col in ["slug", "start_time", "label", "implied_prob"]:
+            u[col] = u[col].ffill().bfill()
+        u = u.reset_index().rename(columns={"index": "timestamp"})
+        u["elapsed"] = (u["timestamp"].astype("int64") // 10**9 - u["start_time"]).astype(int)
+        upsampled.append(u[["slug", "timestamp", "elapsed", "label", "implied_prob"]])
+
+    pm = pd.concat(upsampled, ignore_index=True)
+    pm = pm[(pm["elapsed"] >= 100) & (pm["elapsed"] <= 290)].copy()
+    return pm
+
+
+def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> Dict[str, float]:
+    """Compute all evaluation metrics."""
+    y_prob = np.clip(y_prob, 1e-6, 1 - 1e-6)
+    y_pred = (y_prob >= 0.5).astype(int)
+    try:
+        auc = float(roc_auc_score(y_true, y_prob))
+    except ValueError:
+        auc = np.nan
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "roc_auc": auc,
+        "log_loss": float(log_loss(y_true, y_prob, labels=[0, 1])),
+        "brier": float(brier_score_loss(y_true, y_prob)),
+        "calibration_gap_pp": float(np.mean(np.abs(y_prob - y_true)) * 100.0),
+        "mean_pred": float(np.mean(y_prob)),
+        "mean_actual": float(np.mean(y_true)),
+    }
+
+
+def _extract_overall_row(overall_df: pd.DataFrame, model_name: str) -> pd.Series:
+    m = overall_df[overall_df["model"] == model_name]
+    if m.empty:
+        raise ValueError(f"Model {model_name} not found in overall metrics")
+    return m.iloc[0]
+
+
+def _feature_helpfulness_from_drop(full_row: pd.Series, drop_row: pd.Series) -> Dict[str, float]:
+    # Positive values mean the feature helps (dropping it made the model worse).
+    return {
+        "impact_accuracy": float(full_row["accuracy_mean"] - drop_row["accuracy_mean"]),
+        "impact_roc_auc": float(full_row["roc_auc_mean"] - drop_row["roc_auc_mean"]),
+        "impact_log_loss": float(drop_row["log_loss_mean"] - full_row["log_loss_mean"]),
+        "impact_brier": float(drop_row["brier_mean"] - full_row["brier_mean"]),
+        "impact_calibration_gap_pp": float(drop_row["calibration_gap_pp_mean"] - full_row["calibration_gap_pp_mean"]),
+    }
+
+
+def iter_feature_subsets(feature_pool: List[str]) -> List[Tuple[str, ...]]:
+    subsets: List[Tuple[str, ...]] = []
+    for size in range(1, len(feature_pool) + 1):
+        subsets.extend(itertools.combinations(feature_pool, size))
+    return subsets
+
+
+def run_feature_subset_search(
+    binance_df: pd.DataFrame,
+    polymarket_df: pd.DataFrame,
+    feature_pool: List[str],
+    training_days: int,
+    test_hours: float,
+    step_hours: float,
+    output_path: Path | None = None,
+) -> pd.DataFrame:
+    available = [c for c in feature_pool if c in binance_df.columns]
+    if not available:
+        raise ValueError("No candidate features available for subset search")
+
+    subsets = iter_feature_subsets(available)
+    records = []
+
+    for idx, subset in enumerate(subsets, start=1):
+        subset_cols = list(subset)
+        subset_name = "+".join(subset_cols)
+        print(f"Subset search {idx}/{len(subsets)}: {subset_name}")
+
+        overall_df, _, _ = run_walk_forward_test(
+            binance_df,
+            polymarket_df,
+            training_days=training_days,
+            test_hours=test_hours,
+            step_hours=step_hours,
+            requested_feature_cols=subset_cols,
+            max_splits=1,
+        )
+
+        baseline = _extract_overall_row(overall_df, "7day_logistic_baseline")
+        enhanced = _extract_overall_row(overall_df, "7day_logistic_enhanced")
+        polymarket = _extract_overall_row(overall_df, "polymarket")
+
+        for model_name, row in [
+            ("7day_logistic_baseline", baseline),
+            ("7day_logistic_enhanced", enhanced),
+            ("polymarket", polymarket),
+        ]:
+            records.append(
+                {
+                    "subset_rank_key": subset_name,
+                    "subset_size": len(subset_cols),
+                    "subset_features": subset_name,
+                    "model": model_name,
+                    "accuracy_mean": float(row["accuracy_mean"]),
+                    "roc_auc_mean": float(row["roc_auc_mean"]),
+                    "log_loss_mean": float(row["log_loss_mean"]),
+                    "brier_mean": float(row["brier_mean"]),
+                    "calibration_gap_pp_mean": float(row["calibration_gap_pp_mean"]),
+                    "n_splits": int(row["n_splits"]),
+                }
+            )
+
+        if output_path is not None:
+            pd.DataFrame(records).to_csv(output_path, index=False)
+
+    results_df = pd.DataFrame(records)
+    if results_df.empty:
+        return results_df
+
+    # Helpful ranking columns for the logistic models only.
+    results_df["log_loss_rank"] = results_df.groupby("model")["log_loss_mean"].rank(method="dense", ascending=True)
+    results_df["roc_auc_rank"] = results_df.groupby("model")["roc_auc_mean"].rank(method="dense", ascending=False)
+    return results_df
+
+
+def run_full_feature_ablation(
+    binance_df: pd.DataFrame,
+    polymarket_df: pd.DataFrame,
+    full_overall_df: pd.DataFrame,
+    training_days: int,
+    test_hours: float,
+    step_hours: float,
+) -> pd.DataFrame:
+    available = [c for c in ALL_MODEL_FEATURES if c in binance_df.columns]
+    if len(available) <= 1:
+        raise ValueError("Need at least 2 available features to run ablation")
+
+    baseline_full = _extract_overall_row(full_overall_df, "7day_logistic_baseline")
+    enhanced_full = _extract_overall_row(full_overall_df, "7day_logistic_enhanced")
+
+    records = []
+    for i, dropped in enumerate(available, start=1):
+        keep = [c for c in available if c != dropped]
+        print(f"Ablation {i}/{len(available)}: drop={dropped} | keep={len(keep)}")
+        ab_overall, _, _ = run_walk_forward_test(
+            binance_df,
+            polymarket_df,
+            training_days=training_days,
+            test_hours=test_hours,
+            step_hours=step_hours,
+            requested_feature_cols=keep,
+        )
+
+        baseline_drop = _extract_overall_row(ab_overall, "7day_logistic_baseline")
+        enhanced_drop = _extract_overall_row(ab_overall, "7day_logistic_enhanced")
+
+        rec_base = {
+            "feature_dropped": dropped,
+            "model": "7day_logistic_baseline",
+            "n_features_used": len(keep),
+            **_feature_helpfulness_from_drop(baseline_full, baseline_drop),
+            "full_accuracy": float(baseline_full["accuracy_mean"]),
+            "drop_accuracy": float(baseline_drop["accuracy_mean"]),
+            "full_roc_auc": float(baseline_full["roc_auc_mean"]),
+            "drop_roc_auc": float(baseline_drop["roc_auc_mean"]),
+            "full_log_loss": float(baseline_full["log_loss_mean"]),
+            "drop_log_loss": float(baseline_drop["log_loss_mean"]),
+            "full_brier": float(baseline_full["brier_mean"]),
+            "drop_brier": float(baseline_drop["brier_mean"]),
+            "full_calibration_gap_pp": float(baseline_full["calibration_gap_pp_mean"]),
+            "drop_calibration_gap_pp": float(baseline_drop["calibration_gap_pp_mean"]),
+        }
+        rec_enh = {
+            "feature_dropped": dropped,
+            "model": "7day_logistic_enhanced",
+            "n_features_used": len(keep),
+            **_feature_helpfulness_from_drop(enhanced_full, enhanced_drop),
+            "full_accuracy": float(enhanced_full["accuracy_mean"]),
+            "drop_accuracy": float(enhanced_drop["accuracy_mean"]),
+            "full_roc_auc": float(enhanced_full["roc_auc_mean"]),
+            "drop_roc_auc": float(enhanced_drop["roc_auc_mean"]),
+            "full_log_loss": float(enhanced_full["log_loss_mean"]),
+            "drop_log_loss": float(enhanced_drop["log_loss_mean"]),
+            "full_brier": float(enhanced_full["brier_mean"]),
+            "drop_brier": float(enhanced_drop["brier_mean"]),
+            "full_calibration_gap_pp": float(enhanced_full["calibration_gap_pp_mean"]),
+            "drop_calibration_gap_pp": float(enhanced_drop["calibration_gap_pp_mean"]),
+        }
+        rec_base["helpfulness_score"] = (
+            rec_base["impact_accuracy"]
+            + rec_base["impact_roc_auc"]
+            + rec_base["impact_log_loss"]
+            + rec_base["impact_brier"]
+            + 0.01 * rec_base["impact_calibration_gap_pp"]
+        )
+        rec_enh["helpfulness_score"] = (
+            rec_enh["impact_accuracy"]
+            + rec_enh["impact_roc_auc"]
+            + rec_enh["impact_log_loss"]
+            + rec_enh["impact_brier"]
+            + 0.01 * rec_enh["impact_calibration_gap_pp"]
+        )
+        records.append(rec_base)
+        records.append(rec_enh)
+
+    out = pd.DataFrame(records)
+    out = out.sort_values(["model", "helpfulness_score"], ascending=[True, False]).reset_index(drop=True)
+    return out
+
+
+def run_walk_forward_test(
+    binance_df: pd.DataFrame,
+    polymarket_df: pd.DataFrame,
+    training_days: int = 7,
+    test_hours: float = 6.0,
+    step_hours: float = 6.0,
+    requested_feature_cols: List[str] | None = None,
+    max_splits: int | None = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Run walk-forward backtest comparing baseline/enhanced 7d models vs Polymarket.
+    
+    Returns:
+        (overall metrics DataFrame, per-split metrics DataFrame, row-level predictions DataFrame)
+    """
+    
+    if requested_feature_cols is None:
+        requested_feature_cols = list(PRUNED_MODEL_FEATURES)
+    feature_cols = [c for c in requested_feature_cols if c in binance_df.columns]
+    print(
+        f"Using {len(feature_cols)}/{len(requested_feature_cols)} features. "
+        f"Missing: {[c for c in requested_feature_cols if c not in feature_cols]}"
+    )
+    
+    # Align timestamps
+    binance_df = binance_df.sort_values("open_time").copy()
+    polymarket_df = polymarket_df.sort_values("timestamp").copy()
+    
+    min_ts = max(binance_df["open_time"].min(), polymarket_df["timestamp"].min())
+    max_ts = min(binance_df["open_time"].max(), polymarket_df["timestamp"].max())
+    
+    binance_df = binance_df[(binance_df["open_time"] >= min_ts) & (binance_df["open_time"] <= max_ts)].copy()
+    polymarket_df = polymarket_df[(polymarket_df["timestamp"] >= min_ts) & (polymarket_df["timestamp"] <= max_ts)].copy()
+    
+    # Merge on exact second
+    merged = binance_df.merge(
+        polymarket_df[["timestamp", "slug", "elapsed", "implied_prob", "label"]],
+        left_on="open_time",
+        right_on="timestamp",
+        how="inner",
+    )
+    merged = merged.dropna(subset=feature_cols + ["target_up"]).copy()
+    
+    if len(merged) == 0:
+        raise ValueError("No merged rows after alignment")
+    
+    # Walk-forward setup
+    test_seconds = int(test_hours * 3600)
+    step_seconds = int(step_hours * 3600)
+    train_seconds = int(training_days * 24 * 3600)
+    
+    first_test_ts = binance_df["open_time"].min() + pd.Timedelta(seconds=train_seconds)
+    last_test_ts = binance_df["open_time"].max() - pd.Timedelta(seconds=test_seconds)
+    
+    splits = []
+    row_level_records = []
+    test_start = first_test_ts
+    split_idx = 0
+    
+    while test_start <= last_test_ts:
+        split_idx += 1
+        train_start = test_start - pd.Timedelta(seconds=train_seconds)
+        test_end = test_start + pd.Timedelta(seconds=test_seconds)
+        
+        train_mask = (merged["open_time"] >= train_start) & (merged["open_time"] < test_start)
+        test_mask = (merged["open_time"] >= test_start) & (merged["open_time"] < test_end)
+        
+        train_data = merged[train_mask].copy()
+        test_data = merged[test_mask].copy()
+        
+        if len(train_data) < 100 or len(test_data) < 50:
+            test_start += pd.Timedelta(seconds=step_seconds)
+            continue
+        
+        train_data = train_data.sort_values("open_time").reset_index(drop=True)
+        y_train = train_data["target_up"].astype(int).values
+
+        X_test = test_data[feature_cols]
+        y_test = test_data["target_up"].astype(int).values
+
+        # Baseline model: standard sigmoid calibration via CV on full training fold.
+        base_pipeline = make_base_pipeline(feature_cols)
+        calibrated_model = CalibratedClassifierCV(base_pipeline, method="sigmoid", cv=3)
+        calibrated_model.fit(train_data[feature_cols], y_train)
+        lr_base_probs = np.clip(calibrated_model.predict_proba(X_test)[:, 1], 1e-6, 1 - 1e-6)
+
+        # Enhanced model: time-safe subtrain/calib split + bucket calibrators + shrinkage.
+        cut_idx = int(len(train_data) * 0.8)
+        if cut_idx < 1000 or (len(train_data) - cut_idx) < 500:
+            cut_idx = max(100, int(len(train_data) * 0.7))
+
+        subtrain = train_data.iloc[:cut_idx].copy()
+        calib = train_data.iloc[cut_idx:].copy()
+
+        if len(subtrain) < 100 or len(calib) < 100 or calib["target_up"].nunique() < 2:
+            lr_enh_probs = lr_base_probs.copy()
+            bucket_diag = pd.DataFrame()
+            best_lambda = 1.0
+            shrink_meta = {"log_loss": np.nan, "brier": np.nan, "calib_gap_pp": np.nan}
+        else:
+            subtrain_model = make_base_pipeline(feature_cols)
+            subtrain_model.fit(subtrain[feature_cols], subtrain["target_up"].astype(int).values)
+
+            raw_calib = np.clip(
+                subtrain_model.predict_proba(calib[feature_cols])[:, 1],
+                1e-6,
+                1 - 1e-6,
+            )
+            raw_test = np.clip(
+                subtrain_model.predict_proba(X_test)[:, 1],
+                1e-6,
+                1 - 1e-6,
+            )
+
+            calib_df = pd.DataFrame(
+                {
+                    "elapsed": calib["elapsed"].to_numpy(dtype=float),
+                    "y_true": calib["target_up"].astype(int).to_numpy(),
+                    "raw_prob": raw_calib,
+                    "ts_order": np.arange(len(calib), dtype=int),
+                }
+            )
+            calib_df["elapsed_bucket"] = bucket_series(calib_df["elapsed"])
+
+            calibrators, bucket_diag = fit_bucket_calibrators(calib_df)
+
+            p_calib_bucketed = apply_bucket_calibrators(
+                raw_calib,
+                calib["elapsed"].to_numpy(dtype=float),
+                calibrators,
+            )
+
+            base_rate = float(subtrain["target_up"].mean())
+            best_lambda, shrink_meta = tune_shrinkage_lambda(
+                p_calib_bucketed,
+                calib["target_up"].astype(int).to_numpy(),
+                base_rate,
+            )
+
+            p_test_bucketed = apply_bucket_calibrators(
+                raw_test,
+                test_data["elapsed"].to_numpy(dtype=float),
+                calibrators,
+            )
+            lr_enh_probs = np.clip(best_lambda * p_test_bucketed + (1.0 - best_lambda) * base_rate, 1e-6, 1 - 1e-6)
+
+        lr_base_metrics = compute_metrics(y_test, lr_base_probs)
+        lr_enh_metrics = compute_metrics(y_test, lr_enh_probs)
+        pm_probs = test_data["implied_prob"].astype(float).values
+        pm_metrics = compute_metrics(y_test, pm_probs)
+
+        splits.append({
+            "split_idx": split_idx,
+            "test_start": test_start.isoformat(),
+            "test_end": test_end.isoformat(),
+            "train_rows": len(train_data),
+            "test_rows": len(test_data),
+            "model": "7day_logistic_baseline",
+            **lr_base_metrics,
+        })
+        splits.append({
+            "split_idx": split_idx,
+            "test_start": test_start.isoformat(),
+            "test_end": test_end.isoformat(),
+            "train_rows": len(train_data),
+            "test_rows": len(test_data),
+            "model": "7day_logistic_enhanced",
+            "best_shrinkage_lambda": best_lambda,
+            "enh_calib_holdout_log_loss": shrink_meta.get("log_loss", np.nan) if len(subtrain) >= 100 and len(calib) >= 100 else np.nan,
+            "enh_calib_holdout_brier": shrink_meta.get("brier", np.nan) if len(subtrain) >= 100 and len(calib) >= 100 else np.nan,
+            "enh_calib_holdout_gap_pp": shrink_meta.get("calib_gap_pp", np.nan) if len(subtrain) >= 100 and len(calib) >= 100 else np.nan,
+            **lr_enh_metrics,
+        })
+        splits.append({
+            "split_idx": split_idx,
+            "test_start": test_start.isoformat(),
+            "test_end": test_end.isoformat(),
+            "train_rows": len(train_data),
+            "test_rows": len(test_data),
+            "model": "polymarket",
+            **pm_metrics,
+        })
+
+        split_rows = pd.DataFrame(
+            {
+                "split_idx": split_idx,
+                "timestamp": test_data["open_time"].values,
+                "slug": test_data["slug"].values,
+                "elapsed": test_data["elapsed"].values,
+                "y_true": y_test,
+                "prob_7d_baseline": lr_base_probs,
+                "prob_7d_enhanced": lr_enh_probs,
+                "prob_polymarket": pm_probs,
+            }
+        )
+        row_level_records.append(split_rows)
+
+        if not bucket_diag.empty:
+            chosen = ", ".join(
+                f"{r.bucket}:{r.method}" for r in bucket_diag.itertuples(index=False)
+            )
+        else:
+            chosen = "fallback"
+
+        print(
+            f"Split {split_idx}: {test_start} -> {test_end} | Train: {len(train_data):,} | "
+            f"Test: {len(test_data):,} | lambda={best_lambda:.2f} | bucket_methods={chosen}"
+        )
+        
+        test_start += pd.Timedelta(seconds=step_seconds)
+
+        if max_splits is not None and split_idx >= max_splits:
+            break
+    
+    if not splits:
+        raise ValueError("No valid walk-forward splits generated")
+    
+    splits_df = pd.DataFrame(splits)
+    
+    # Overall metrics averaged across splits
+    overall = []
+    for model_name in ["7day_logistic_baseline", "7day_logistic_enhanced", "polymarket"]:
+        model_data = splits_df[splits_df["model"] == model_name]
+        metrics = {
+            "model": model_name,
+            "n_splits": model_data["split_idx"].nunique(),
+            "accuracy_mean": model_data["accuracy"].mean(),
+            "accuracy_std": model_data["accuracy"].std(),
+            "roc_auc_mean": model_data["roc_auc"].mean(),
+            "roc_auc_std": model_data["roc_auc"].std(),
+            "log_loss_mean": model_data["log_loss"].mean(),
+            "log_loss_std": model_data["log_loss"].std(),
+            "brier_mean": model_data["brier"].mean(),
+            "brier_std": model_data["brier"].std(),
+            "calibration_gap_pp_mean": model_data["calibration_gap_pp"].mean(),
+            "calibration_gap_pp_std": model_data["calibration_gap_pp"].std(),
+        }
+        overall.append(metrics)
+    
+    overall_df = pd.DataFrame(overall)
+    
+    row_level_df = pd.concat(row_level_records, ignore_index=True) if row_level_records else pd.DataFrame()
+    return overall_df, splits_df, row_level_df
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Strict walk-forward comparison: baseline/enhanced 7-day logistic vs Polymarket"
+    )
+    parser.add_argument(
+        "--polymarket-csv",
+        default=r"C:\Users\fiona\Desktop\polymarket_bot\notes\resources\market_data_2sec_weekly5_with_resolutions.csv",
+        help="Path to Polymarket 2-second data",
+    )
+    parser.add_argument(
+        "--binance-cache",
+        default=r"C:\Users\fiona\Desktop\polymarket_bot\notes\resources\binance_1s_for_polymarket_window.csv",
+        help="Path to cache Binance 1-second data",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="research/polymarket_model/strict_7day_vs_pm_pruned_microstructure_results",
+        help="Output directory for results",
+    )
+    parser.add_argument("--symbol", default="BTCUSDT", help="Binance symbol")
+    parser.add_argument("--test-hours", type=float, default=6.0, help="Test block length in hours")
+    parser.add_argument("--step-hours", type=float, default=6.0, help="Step between test blocks in hours")
+    parser.add_argument(
+        "--run-full-ablation",
+        action="store_true",
+        help="Run leave-one-feature-out ablation for every active feature",
+    )
+    parser.add_argument(
+        "--run-subset-search",
+        action="store_true",
+        help="Run exhaustive subset search over the curated candidate feature pool",
+    )
+    args = parser.parse_args()
+
+    print("Loading Polymarket data...")
+    pm = load_polymarket_1s(Path(args.polymarket_csv))
+    print(f"Polymarket: {len(pm):,} rows from {pm['timestamp'].min()} to {pm['timestamp'].max()}")
+
+    # Load or fetch Binance data
+    cache_path = Path(args.binance_cache)
+    start_ts = pm["timestamp"].min().floor("s")
+    end_ts = pm["timestamp"].max().ceil("s")
+
+    if cache_path.exists():
+        print(f"Loading Binance cache from {cache_path}...")
+        bn = pd.read_csv(cache_path)
+        bn["open_time"] = pd.to_datetime(bn["open_time"], utc=True)
+        bn = bn[(bn["open_time"] >= start_ts) & (bn["open_time"] <= end_ts)].copy()
+        missing_new = [c for c in NEW_INTRABAR_FEATURES if c not in bn.columns]
+        if missing_new:
+            print(f"Cache missing new feature columns: {missing_new}. Recomputing now...")
+            bn = add_new_intrabar_features(bn)
+            bn.to_csv(cache_path, index=False)
+            print(f"Updated cache with new feature columns at {cache_path}")
+    else:
+        print("Fetching Binance 1-second data...")
+        start_ms = int(start_ts.timestamp() * 1000)
+        end_ms = int(end_ts.timestamp() * 1000)
+        raw = fetch_klines_1s_chunked(args.symbol, start_ms, end_ms, chunk_hours=6)
+        bn = build_binance_df(raw)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        bn.to_csv(cache_path, index=False)
+        print(f"Cached Binance data to {cache_path}")
+
+    print(f"Binance: {len(bn):,} rows from {bn['open_time'].min()} to {bn['open_time'].max()}")
+
+    print(f"Using pruned feature set: {PRUNED_MODEL_FEATURES}")
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.run_subset_search:
+        print("\nRunning exhaustive subset search on curated feature pool...")
+        subset_path = out_dir / "subset_search_results.csv"
+        subset_df = run_feature_subset_search(
+            bn,
+            pm,
+            feature_pool=SUBSET_SEARCH_FEATURE_POOL,
+            training_days=7,
+            test_hours=args.test_hours,
+            step_hours=args.step_hours,
+            output_path=subset_path,
+        )
+
+        if subset_df.empty:
+            raise ValueError("Subset search returned no results")
+
+        logistic_only = subset_df[subset_df["model"].isin(["7day_logistic_baseline", "7day_logistic_enhanced"])]
+        if not logistic_only.empty:
+            best_row = logistic_only.sort_values(["log_loss_mean", "roc_auc_mean", "accuracy_mean"], ascending=[True, False, False]).iloc[0]
+            print("\nBest subset by model-ranked log loss:")
+            print(
+                f"model={best_row['model']} | subset={best_row['subset_features']} | "
+                f"log_loss={best_row['log_loss_mean']:.6f} | roc_auc={best_row['roc_auc_mean']:.6f} | "
+                f"accuracy={best_row['accuracy_mean']:.6f}"
+            )
+
+        print(f"\nSubset search results saved to {subset_path}")
+        return
+
+    print("\nRunning walk-forward validation (7-day training windows)...")
+    overall_df, splits_df, row_level_df = run_walk_forward_test(
+        bn,
+        pm,
+        training_days=7,
+        test_hours=args.test_hours,
+        step_hours=args.step_hours,
+    )
+
+    # Save results
+
+    overall_df.to_csv(out_dir / "overall_comparison.csv", index=False)
+    splits_df.to_csv(out_dir / "per_split_metrics.csv", index=False)
+    row_level_df.to_csv(out_dir / "row_level_predictions.csv", index=False)
+
+    print("\n" + "=" * 60)
+    print("OVERALL COMPARISON (7-day Training Window)")
+    print("=" * 60)
+    print(overall_df.to_string(index=False))
+
+    # Determine winner
+    print("\n" + "=" * 60)
+    print("METRIC WINS (higher better → AUC/Accuracy, lower better → Log Loss/Brier/CalibGap)")
+    print("=" * 60)
+    metrics = ["accuracy", "roc_auc", "log_loss", "brier", "calibration_gap_pp"]
+    higher_better = ["accuracy", "roc_auc"]
+    models = overall_df["model"].tolist()
+    wins = {m: 0 for m in models}
+
+    for m in metrics:
+        col = f"{m}_mean"
+        if col not in overall_df.columns:
+            continue
+        if m in higher_better:
+            winner = overall_df.loc[overall_df[col].idxmax(), "model"]
+        else:
+            winner = overall_df.loc[overall_df[col].idxmin(), "model"]
+        wins[winner] += 1
+        winner_val = float(overall_df.loc[overall_df["model"] == winner, col].iloc[0])
+        print(f"{m:25s}: {winner:24s} ({winner_val:.6f})")
+
+    wins_sorted = sorted(wins.items(), key=lambda x: x[1], reverse=True)
+    print("\nTotal wins by model:")
+    for model_name, w in wins_sorted:
+        print(f"  {model_name}: {w}")
+
+    top_model = wins_sorted[0][0]
+    if top_model == "polymarket":
+        print(">>> WINNER: Polymarket Implied Probabilities")
+    elif top_model == "7day_logistic_enhanced":
+        print(">>> WINNER: 7-day Logistic (Enhanced Calibration)")
+    else:
+        print(">>> WINNER: 7-day Logistic (Baseline Calibration)")
+
+    print(f"\nResults saved to {out_dir}/")
+
+    if args.run_full_ablation:
+        print("\n" + "=" * 60)
+        print("RUNNING FULL FEATURE ABLATION (DROP 1 FEATURE AT A TIME)")
+        print("=" * 60)
+        ablation_df = run_full_feature_ablation(
+            bn,
+            pm,
+            full_overall_df=overall_df,
+            training_days=7,
+            test_hours=args.test_hours,
+            step_hours=args.step_hours,
+        )
+        ablation_df.to_csv(out_dir / "full_feature_ablation.csv", index=False)
+        print("\nTop helpful features by model (higher helpfulness_score = better to keep):")
+        for model_name in ["7day_logistic_baseline", "7day_logistic_enhanced"]:
+            top = ablation_df[ablation_df["model"] == model_name].head(5)
+            print(f"\n{model_name}:")
+            for r in top.itertuples(index=False):
+                print(
+                    f"  keep {r.feature_dropped:35s} | score={r.helpfulness_score:+.6f} "
+                    f"| impact_log_loss={r.impact_log_loss:+.6f} | impact_roc_auc={r.impact_roc_auc:+.6f}"
+                )
+        print(f"\nAblation report saved to {out_dir / 'full_feature_ablation.csv'}")
+
+
+if __name__ == "__main__":
+    main()
