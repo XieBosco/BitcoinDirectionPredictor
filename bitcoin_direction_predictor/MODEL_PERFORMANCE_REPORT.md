@@ -3,7 +3,7 @@
 ## Executive Summary
 This report evaluates a **calibrated Logistic Regression model** that predicts whether Bitcoin will close **UP or DOWN** in 5-minute intervals. The model combines Polymarket implied log-odds and intra-candle microstructure variables, trained on Polymarket 2-second order book data and tested against **actual Binance 1-second spot ground truth data** across the exact corresponding time period (`Feb 23, 2026` to `Mar 5, 2026`).
 
-To prevent pseudo-replication from intra-candle tick autocorrelation, parameter standard errors are computed using the **Huber-White cluster-robust sandwich covariance matrix** grouped by 5-minute candle. Every prediction produces a **95% Wald Confidence Interval**, distinguishing between **high-conviction directional calls** ($P_{\text{lower}} > 0.5$ or $P_{\text{upper}} < 0.5$) and **neutral / uncertain market regimes**.
+By modeling in logit space and evaluating out-of-sample on strictly future 5-minute candle blocks, the model produces calibrated direction probabilities $P(\text{Up})$ and binary directional calls evaluated against Binance spot settlement.
 
 ---
 
@@ -59,33 +59,17 @@ Features are standardized to ensure $L_2$ regularization treats microstructure f
 
 ---
 
-## Confidence Interval & High-Conviction Analysis
-By computing cluster-robust Wald confidence intervals for each prediction:
-- **Confident Calls**: 25,510 samples (90.7% of test set) where the 95% CI does not overlap 0.5.
-  - **Accuracy**: **0.8161 (81.61%)**
-  - **Log Loss**: **0.3917**
-  - **Brier Score**: **0.1279**
-- **Neutral / Uncertain Calls**: 2,627 samples (9.3% of test set) where the 95% CI spans 0.5.
-  - **Accuracy**: **0.5364 (53.64%)**
-  - **Log Loss**: **0.6897**
-  - **Brier Score**: **0.2483**
-
-> [!TIP]
-> **Trading Edge**: The cluster-robust standard errors provide a reliable statistical filter. When market signals are ambiguous (CI spans 0.5), trade execution can be avoided to reduce transaction friction and adverse selection.
-
----
-
 ## Intra-Candle Performance by Elapsed Time
 Predictability changes substantially as the 5-minute candle progresses toward resolution:
 
-| Elapsed Bucket | Samples | Actual Up Rate | LR Accuracy | Raw PM Accuracy | LR AUC | LR Log Loss | LR Brier | Confident % |
-|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 100-129s | 4,439 | 0.507 | 0.6979 | 0.6963 | 0.7642 | 0.5789 | 0.1983 | 87.6% |
-| 130-159s | 4,439 | 0.507 | 0.7150 | 0.7173 | 0.7969 | 0.5436 | 0.1843 | 86.6% |
-| 160-189s | 4,437 | 0.507 | 0.7595 | 0.7703 | 0.8556 | 0.4635 | 0.1552 | 90.2% |
-| 190-219s | 4,438 | 0.507 | 0.8105 | 0.8123 | 0.8998 | 0.3953 | 0.1289 | 91.5% |
-| 220-249s | 4,436 | 0.507 | 0.8411 | 0.8406 | 0.9249 | 0.3480 | 0.1100 | 92.3% |
-| 250-290s | 5,948 | 0.507 | 0.8838 | 0.8840 | 0.9621 | 0.2466 | 0.0788 | 94.5% |
+| Elapsed Bucket | Samples | Actual Up Rate | LR Accuracy | Raw PM Accuracy | LR AUC | LR Log Loss | LR Brier |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 100-129s | 4,439 | 0.507 | 0.6979 | 0.6963 | 0.7642 | 0.5789 | 0.1983 |
+| 130-159s | 4,439 | 0.507 | 0.7150 | 0.7173 | 0.7969 | 0.5436 | 0.1843 |
+| 160-189s | 4,437 | 0.507 | 0.7595 | 0.7703 | 0.8556 | 0.4635 | 0.1552 |
+| 190-219s | 4,438 | 0.507 | 0.8105 | 0.8123 | 0.8998 | 0.3953 | 0.1289 |
+| 220-249s | 4,436 | 0.507 | 0.8411 | 0.8406 | 0.9249 | 0.3480 | 0.1100 |
+| 250-290s | 5,948 | 0.507 | 0.8838 | 0.8840 | 0.9621 | 0.2466 | 0.0788 |
 
 
 ### Key Timing Insights:
@@ -95,6 +79,6 @@ Predictability changes substantially as the 5-minute candle progresses toward re
 ---
 
 ## Conclusion & Verification Summary
-- **Statistically Sound Uncertainty**: Incorporating cluster-robust parameter covariance correctly accounts for repeated intra-candle ticks, eliminating false precision.
-- **Improved Log-Odds Calibration**: Transforming implied probability to logit space eliminates probability squashing, achieving competitive scoring rules and strong discrimination (0.8843 ROC-AUC).
+- **Calibrated Log-Odds Modeling**: Transforming implied probability to logit space eliminates probability squashing, achieving competitive scoring rules and strong discrimination (0.8843 ROC-AUC).
+- **Intra-Candle Progression**: Predictability scales monotonically as the candle closes, reaching ~88.4% accuracy and 0.9621 ROC-AUC in the final 40 seconds.
 - **Execution Consistency**: Dynamic winner calculations and cluster-level block bootstrapping provide an honest, reproducible benchmark against Polymarket raw implied odds.

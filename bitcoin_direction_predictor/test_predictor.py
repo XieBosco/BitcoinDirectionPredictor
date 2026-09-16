@@ -15,6 +15,7 @@ if str(_current_dir) not in sys.path:
 
 try:
     from predict_btc_direction import (
+        LogisticRegressionPredictor,
         LogisticRegressionWithCI,
         compute_metrics,
         compute_ece,
@@ -22,6 +23,7 @@ try:
     )
 except ModuleNotFoundError:
     from bitcoin_direction_predictor.predict_btc_direction import (
+        LogisticRegressionPredictor,
         LogisticRegressionWithCI,
         compute_metrics,
         compute_ece,
@@ -29,7 +31,7 @@ except ModuleNotFoundError:
     )
 
 
-def test_logistic_regression_with_ci():
+def test_logistic_regression_predictor():
     rng = np.random.default_rng(42)
     n = 1000
     X = rng.normal(size=(n, 2))
@@ -37,32 +39,28 @@ def test_logistic_regression_with_ci():
     p_true = 1.0 / (1.0 + np.exp(-logits))
     y = rng.binomial(1, p_true)
 
-    model = LogisticRegressionWithCI(C=1.0, scale_features=True)
+    model = LogisticRegressionPredictor(C=1.0, scale_features=True)
     model.fit(X, y)
 
-    # Test predictions with 95% CI on 2D input
-    p_pred, p_lower, p_upper, se_logit = model.predict_proba_with_ci(X[:20], confidence_level=0.95)
+    # Test predictions on 2D input
+    p_pred = model.predict_proba(X[:20])
 
     assert len(p_pred) == 20
     assert np.all((p_pred >= 0.0) & (p_pred <= 1.0))
-    assert np.all((p_lower >= 0.0) & (p_lower <= 1.0))
-    assert np.all((p_upper >= 0.0) & (p_upper <= 1.0))
-    assert np.all(p_lower <= p_pred)
-    assert np.all(p_pred <= p_upper)
-    assert np.all(se_logit > 0)
 
     # Test direction classification
-    res_df = model.predict_direction(X[:20], confidence_level=0.95)
+    res_df = model.predict_direction(X[:20])
+    assert len(res_df) == 20
+    assert "pred_prob_up" in res_df.columns
+    assert "direction_call" in res_df.columns
+    assert "pred_binary" in res_df.columns
     for _, row in res_df.iterrows():
-        if row["ci_lower"] > 0.5:
+        if row["pred_prob_up"] >= 0.5:
             assert row["direction_call"] == "UP"
-            assert row["is_confident"] is True
-        elif row["ci_upper"] < 0.5:
-            assert row["direction_call"] == "DOWN"
-            assert row["is_confident"] is True
+            assert row["pred_binary"] == 1
         else:
-            assert row["direction_call"] == "NEUTRAL"
-            assert row["is_confident"] is False
+            assert row["direction_call"] == "DOWN"
+            assert row["pred_binary"] == 0
 
 
 def test_single_sample_and_series_inference():
@@ -71,46 +69,40 @@ def test_single_sample_and_series_inference():
     X = rng.normal(size=(200, 4))
     y = rng.binomial(1, 0.5, size=200)
 
-    model = LogisticRegressionWithCI(C=1.0, scale_features=True)
+    model = LogisticRegressionPredictor(C=1.0, scale_features=True)
     model.fit(X, y)
 
     # 1. 1D numpy array (shape: (4,))
     single_vec = np.array([0.5, -0.2, 1.1, -0.4])
-    p_pred, p_lower, p_upper, se = model.predict_proba_with_ci(single_vec)
+    p_pred = model.predict_proba(single_vec)
     assert p_pred.shape == (1,)
     assert 0.0 <= p_pred[0] <= 1.0
-    assert 0.0 <= p_lower[0] <= p_pred[0] <= p_upper[0] <= 1.0
 
     dir_df = model.predict_direction(single_vec)
     assert len(dir_df) == 1
-    assert dir_df["direction_call"].iloc[0] in ["UP", "DOWN", "NEUTRAL"]
+    assert dir_df["direction_call"].iloc[0] in ["UP", "DOWN"]
 
     # 2. pd.Series
     series_input = pd.Series(single_vec, index=[f"x{i}" for i in range(4)])
-    p_pred_s, p_lower_s, p_upper_s, se_s = model.predict_proba_with_ci(series_input)
+    p_pred_s = model.predict_proba(series_input)
     assert p_pred_s.shape == (1,)
     assert np.isclose(p_pred[0], p_pred_s[0])
 
 
-def test_cluster_robust_covariance():
-    """Verify that cluster sandwich covariance executes and produces positive variances."""
+def test_model_coefficients_and_scaling():
+    """Verify that model fits correctly with feature scaling and produces valid coefficients."""
     rng = np.random.default_rng(42)
-    n_clusters = 50
-    rows_per_cluster = 10
-    n = n_clusters * rows_per_cluster
-    cluster_ids = np.repeat(np.arange(n_clusters), rows_per_cluster)
-
-    X = rng.normal(size=(n, 3))
+    n = 200
+    X = rng.normal(loc=100.0, scale=15.0, size=(n, 3))
     y = rng.binomial(1, 0.5, size=n)
 
-    model = LogisticRegressionWithCI(C=1.0)
-    model.fit(X, y, cluster_ids=cluster_ids)
+    model = LogisticRegressionPredictor(C=1.0, scale_features=True)
+    model.fit(X, y)
 
-    assert model.cov_params_ is not None
-    assert model.cov_params_.shape == (4, 4)  # intercept + 3 features
-    # Diagonal variances must be strictly positive
-    variances = np.diag(model.cov_params_)
-    assert np.all(variances > 0.0)
+    assert model.beta_ is not None
+    assert len(model.beta_) == 4  # intercept + 3 features
+    assert model.scaler is not None
+    assert np.all(np.isfinite(model.beta_))
 
 
 def test_compute_metrics():
@@ -156,25 +148,25 @@ def test_pipeline_outputs_exist():
     base_dir = Path(__file__).resolve().parent
 
     assert (base_dir / "predict_btc_direction.py").exists()
-    assert (base_dir / "test_predictions_with_ci.csv").exists()
+    assert (base_dir / "test_predictions.csv").exists() or (base_dir / "test_predictions_with_ci.csv").exists()
     assert (base_dir / "evaluation_metrics.csv").exists()
     assert (base_dir / "time_bucket_metrics.csv").exists()
     assert (base_dir / "MODEL_PERFORMANCE_REPORT.md").exists()
 
-    # Verify CSV files are non-empty and well-formed
-    preds = pd.read_csv(base_dir / "test_predictions_with_ci.csv")
+    pred_file = base_dir / "test_predictions.csv"
+    if not pred_file.exists():
+        pred_file = base_dir / "test_predictions_with_ci.csv"
+    preds = pd.read_csv(pred_file)
     assert len(preds) > 0
     assert "prob_up_pred" in preds.columns
-    assert "ci_lower" in preds.columns
-    assert "ci_upper" in preds.columns
     assert "direction_call" in preds.columns
-    assert "is_confident" in preds.columns
+    assert "pred_binary" in preds.columns
 
 
 if __name__ == "__main__":
-    test_logistic_regression_with_ci()
+    test_logistic_regression_predictor()
     test_single_sample_and_series_inference()
-    test_cluster_robust_covariance()
+    test_model_coefficients_and_scaling()
     test_compute_metrics()
     test_cluster_bootstrap()
     test_pipeline_outputs_exist()

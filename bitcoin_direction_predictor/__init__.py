@@ -3,6 +3,7 @@ Bitcoin 5-Minute Direction Predictor Package.
 """
 
 from .predict_btc_direction import (
+    LogisticRegressionPredictor,
     LogisticRegressionWithCI,
     compute_metrics,
     compute_ece,
@@ -12,6 +13,7 @@ from .predict_btc_direction import (
 )
 
 __all__ = [
+    "LogisticRegressionPredictor",
     "LogisticRegressionWithCI",
     "compute_metrics",
     "compute_ece",
